@@ -82,6 +82,4 @@ near the top:
 
 The GARCH variants additionally require `garch_flag = 1` (and the `Garch` name
 stem); the empirical-application files come from running `ApplicationQuarterly.m`
-at `P_LP = 8` and `P_LP = 10`. These result files are large and are not shipped
-with the code — generate or copy them into `SimulationsResults/` before running
-`PlotsPaper.m`.
+at `P_LP = 8` and `P_LP = 10`.
