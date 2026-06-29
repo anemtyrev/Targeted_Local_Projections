@@ -1,0 +1,525 @@
+clc 
+clear all
+close all
+% --- paths (robust to current working directory) ---
+script_dir  = fileparts(mfilename('fullpath'));
+addpath(genpath(fullfile(script_dir, 'Subroutines')));
+results_dir = fullfile(script_dir, 'SimulationsResults');
+if ~exist(results_dir, 'dir'); mkdir(results_dir); end
+addpath(results_dir);
+
+name_sim = "Test_T";
+eta_scale = [1 2 4 8 16 32 64];
+
+for eee = 1:length(eta_scale)
+
+%% set parameters
+%parameters for data generation
+T           = [200 800];        % number of observations
+T_burn      = 2000;                 % number of periods that we have to burn
+
+seed        = 1;         % seed of seed generator (1 default)
+H_min       = 0;         % first horizon 
+H_max       = 24;        % number of horizons we care about
+one_matrix  = 0;         % generate LP in onematrix = 1; generate LP in separate cells = 0.
+which_irf_y = 2;         % which dependent variable
+which_irf_x = 1;         % which independent variable
+
+%% Olea et al style SW DGP (only DGP used)
+p_DGP   = 1;
+scheme_name_DGP = 'mpshock';  % mpshock, lshock, or mprecursive
+specification_DGP = 'fixp'; %   - spec: worst (worst-case), estp (estimated p), fixp (fixed p)
+MA_term_scale = eta_scale(eee);          % == 1 for standard case
+garch_flag = 0;
+bypass_Tscale = 0;
+
+
+%% Estimation section
+
+%estimation parameters
+P_LP        = 10;         % number of lags in LP(P), P=0 means no lags
+P_VAR       = 8;          % number of lags in VAR(P) for the target
+P_VARq      = P_VAR;      % number of lags in VAR(q) for VAR only
+which_VAR   = 0;          % 0 - estimated VAR coef, 1 - mean VAR bootstrap, 2 - median VAR bootstrap
+missspec    = 0; 
+
+%% SLP settings 
+quadratic_method = 3;     % 2 for URE, 3 for CV;
+HAC_kernel       = 2;     % 2 for spectral, 1 for linear;
+method           = 0;     % selection criterion for LP-VAR, URE = 0, URE boot = 2
+smooth_all       = 0;     % if smooth_all == 1, we smooth all coeficients
+use_studentized_boot = 0; % use or not use studentised bootstrap, huge time cost 
+
+%% TLP settings 
+covar_ind            = 1;          % covar_ind == 1 -- use covariance
+lambda_par           = 2;    % 0: lambda_opt = 0, 1: lambda_opt = lambda_set, 2: lambda_opt=lambda_opt
+use_Hausman          = 0;    % 1 for use Hausman test, 0 for no Hausmann test
+use_TLP_boot         = 1;    % TLP bootstrap
+use_cov_from_var     = 0;    % use variance from VAR as covariance
+use_double_bootstrap = 1;    % 1 for double bootstrap (needed for symmetric CI), 0 for single
+use_second_level_tlp_variance = 1; % 1 = direct TLP variance from second-level random-weight TLP draws
+
+%if lambda_par == 1
+lambda_set = 500;
+
+%% Simulation settings 
+%monte-carlo simulation
+simulations = 1000;
+number_of_cores = 48;
+rng(seed)
+
+%Bootstrap and HAC parameters
+use_iid_boot_TLP = 0;
+alpha = 10; % 1-alpha CI
+bootstrapN = 200;
+bootstrapN_TLP = 200;
+block_length = H_max+1-H_min;
+nlag = H_max+1-H_min;
+
+%generate random seed for each iteration of parfor loop
+random_seed = randi([0 (2^32-1)],1,simulations);
+
+%find corresponding irf_VAR
+k           = 2;          % Olea SW DGP is a 2-variable system
+iii = [[1:k^2]' repelem([1:k]',k,1) repmat([1:k]',k,1)];
+which_irf_var = iii(iii(:,2)==which_irf_y & iii(:,3)==which_irf_x);
+
+% random seed generateor for bootstrap 
+% random_seed_boot = randi([0 (2^32-1)],bootstrapN,simulations);
+
+%%
+for j = 1:length(T)
+
+%% useful objects
+P_LP2 = P_LP+1;   % This is written this way as code is too complicated to change
+
+% usefull structure
+str.H_min               = H_min;
+str.H_max               = H_max;
+str.P_VAR               = P_VAR;
+str.P_VARq              = P_VARq;
+str.P_LP                = P_LP2;
+str.one_matrix          = one_matrix;
+str.BootN               = bootstrapN;
+str.BootN_TLP           = bootstrapN_TLP;
+str.alpha               = alpha;
+str.which_irf_y         = which_irf_y;
+str.which_irf_x         = which_irf_x;
+str.which_irf_var       = which_irf_var;
+str.k                   = k;
+% str.random_seed_boot    = random_seed_boot;
+str.T                   = T(j);
+str.T_burn              = T_burn;
+str.HAC_kernel          = HAC_kernel;
+str.block_length        = block_length;
+str.method              = method;
+str.simulations         = simulations;
+str.use_double_bootstrap=use_double_bootstrap;
+str.use_second_level_tlp_variance=use_second_level_tlp_variance;
+
+%% Estimation
+output_cell = cell(simulations,1);
+queue = createParallelProgressBar(simulations); %initiate parfor progress bar
+tic
+parfor (i=1:simulations,number_of_cores)
+% for i=1:simulations
+    %setting each repetition to the same seed (parfoor options)
+    rng(random_seed(i),"twister");
+
+    % generate data from the Olea et al. (Smets-Wouters) DGP
+    data = run_Olea_DGP(str,p_DGP,scheme_name_DGP,specification_DGP,MA_term_scale,garch_flag,bypass_Tscale);
+    irf_true = data.dgp.irs_true;
+
+    irf_LP = [];
+    irf_SLP = [];
+
+    % get IRF LP and SLP (unchanged - using original functions)
+    if MA_term_scale ==1
+       temp2  = irf_SLP_function(data,str,quadratic_method,1,1,use_studentized_boot,1);
+       irf_LP = temp2.LP;
+       irf_SLP = temp2.SLP;
+    end
+    % Initialize output structures
+    irf_VAR = [];
+    irf_BLP = [];
+    irf_TLP2 = [];  % NEW: Only one comprehensive TLP function call needed
+        
+    for p=1:length(P_VAR)
+        str2 = str;
+        str2.P_VAR  = P_VAR(p);
+        str2.P_VARq = P_VAR(p);
+
+        % get IRF VAR (unchanged)
+    %    irf_VAR{p} = irf_VAR_function(data,str2,str2.P_VAR);
+
+        % get BLP (unchanged)
+        if T(j)~=100
+            irf_BLP{p} = irf_BLP_function(data,str2);
+        end
+        
+        % NEW: Call irf_TLP_function ONCE with double bootstrap
+        % This single call provides:
+        % - LP results (bias-corrected & Quantile CIs)
+        % - VAR results (bias-corrected & Quantile CIs)  
+        % - TLP results (bias-corrected & Quantile CIs)
+        % - Symmetric CIs (methods 7-9) based on Hall (1988)
+        % All from one comprehensive double bootstrap procedure
+        str2.use_double_bootstrap = use_double_bootstrap;
+        str2.use_second_level_tlp_variance = use_second_level_tlp_variance;
+        compute_SLP = 1;
+        use_bootstrap_bias = 1;  % NEW: 1 = use bootstrap-layer bias, 0 = use original sample bias
+        irf_TLP2{p} = irf_TLP_function(data, str2, use_TLP_boot, use_iid_boot_TLP, use_cov_from_var, [], compute_SLP, use_bootstrap_bias, use_second_level_tlp_variance);
+    end    
+
+    %% save the cell
+    output_s = [];
+    output_s.irf_LP       = irf_LP;
+    output_s.irf_BLP      = irf_BLP;
+    output_s.irf_SLP      = irf_SLP;
+    output_s.irf_VAR      = irf_VAR;
+    
+    % NEW: Comprehensive TLP2 output from irf_TLP_function
+    % Contains LP, VAR, and TLP with both bias-corrected, Quantile, and Symmetric CIs
+    output_s.irf_TLP2     = irf_TLP2;
+    
+    output_s.irf_true     = irf_true;
+    output_cell{i} = output_s;
+    send(queue, i);
+end    
+toc
+
+%% Unpack the cell 
+% =========================================================================
+% MODIFIED: Updated unpack_cell to handle new comprehensive TLP outputs
+% including symmetric bootstrap methods 7-9
+% =========================================================================
+output = unpack_cell(output_cell,str);
+irf_true = output_cell{1}.irf_true;
+
+%% Compute statistics from simulation outputs
+% =========================================================================
+% ALL get_stats calls are now guarded with isfield/isempty checks
+% =========================================================================
+
+stats = struct();  % initialize clean
+
+if isfield(output, 'LP') && isfield(output.LP, 'H') && ~isempty(output.LP.H)
+    stats.LP.H = get_stats(output.LP.H, irf_true, "LP HAC");
+end
+if isfield(output, 'SLP') && isfield(output.SLP, 'H') && ~isempty(output.SLP.H)
+    stats.SLP.H = get_stats(output.SLP.H, irf_true, "SLP HAC");
+end
+if isfield(output, 'SLP') && isfield(output.SLP, 'H_US') && ~isempty(output.SLP.H_US)
+    stats.SLP.H_US = get_stats(output.SLP.H_US, irf_true, "SLP HAC Undersmoothed");
+end
+if isfield(output, 'LP') && isfield(output.LP, 'B') && ~isempty(output.LP.B)
+    stats.LP.B = get_stats(output.LP.B, irf_true, "LP MBB Bootstrap");
+end
+if isfield(output, 'SLP') && isfield(output.SLP, 'B') && ~isempty(output.SLP.B)
+    stats.SLP.B = get_stats(output.SLP.B, irf_true, "SLP MBB Bootstrap");
+end
+
+if T(j) ~= 100 && isfield(output, 'BLP') && ~isempty(output.BLP)
+    stats.BLP = get_stats(output.BLP, irf_true, "BLP", str);
+end
+
+% VAR (Direct)
+if isfield(output, 'VAR') && isfield(output.VAR, 'B') && ~isempty(output.VAR.B)
+    stats.VAR.direct = get_stats(output.VAR.B, irf_true, "VAR Recursive Bootstrap", str);
+end
+
+% Initialize methods - NOW INCLUDING SYMMETRIC METHODS 7-9
+methods = {'method1','method2','method3','method4','method5','method6',...
+           'method7','method8','method9'};
+method_names = {...
+    'Subtract Bootstrap Mean',...
+    'Subtract VAR',...
+    'Subtract Original',...
+    'Bootstrap Mean (Non-Inverted)',...
+    'Subtract VAR (Non-Inverted)',...
+    'Subtract Original (Non-Inverted)',...
+    'Symmetric Bootstrap Mean (Hall 1988)',...
+    'Symmetric VAR Original (Hall 1988)',...
+    'Symmetric Original Own (Hall 1988)'};
+
+% TLP2 stats - Loop over all methods (including symmetric 7-9)
+for m = 1:length(methods)
+    method = methods{m};
+    method_label = method_names{m};
+    
+    % LP with different methods
+    if isfield(output, 'LP2') && isfield(output.LP2, 'Studentized') && isfield(output.LP2.Studentized, method)
+        stats.LP.Studentized.(method) = get_stats(output.LP2.Studentized.(method), irf_true, ...
+            sprintf("LP Studentized %s ", method_label), str);
+    end
+    
+    % VAR with different methods
+    if isfield(output, 'VAR2') && isfield(output.VAR2, 'Studentized') && isfield(output.VAR2.Studentized, method)
+        stats.VAR.Studentized.(method) = get_stats(output.VAR2.Studentized.(method), irf_true, ...
+            sprintf("VAR Studentized %s ", method_label), str);
+    end
+    
+    % SLP Studentized with different methods
+    if isfield(output, 'SLP2') && isfield(output.SLP2, 'Studentized') && isfield(output.SLP2.Studentized, method)
+        stats.SLP.Studentized.(method) = get_stats(output.SLP2.Studentized.(method), irf_true, ...
+            sprintf("SLP Studentized %s ", method_label), str);
+    end
+
+    % TLP Studentized with different methods
+    if isfield(output, 'TLP2') && isfield(output.TLP2, 'Studentized') && isfield(output.TLP2.Studentized, method)
+        stats.TLP.Studentized.(method) = get_stats(output.TLP2.Studentized.(method), irf_true, ...
+            sprintf("TLP Studentized %s ", method_label), str);
+    end
+    
+    % TLP CombinedQuantile with different methods
+    if isfield(output, 'TLP2') && isfield(output.TLP2, 'CombinedQuantile') && isfield(output.TLP2.CombinedQuantile, method)
+        stats.TLP.CombinedQuantile.(method) = get_stats(output.TLP2.CombinedQuantile.(method), irf_true, ...
+            sprintf("TLP Combined %s ", method_label), str);
+    end
+end
+
+% Quantile bands (no method variation - same for all)
+if isfield(output, 'LP2') && isfield(output.LP2, 'Quantile') && ~isempty(output.LP2.Quantile)
+    stats.LP.Quantile = get_stats(output.LP2.Quantile, irf_true, "LP Bootstrap Quantile", str);
+end
+if isfield(output, 'VAR2') && isfield(output.VAR2, 'Quantile') && ~isempty(output.VAR2.Quantile)
+    stats.VAR.Quantile = get_stats(output.VAR2.Quantile, irf_true, "VAR Bootstrap Quantile", str);
+end
+if isfield(output, 'TLP2') && isfield(output.TLP2, 'Quantile') && ~isempty(output.TLP2.Quantile)
+    stats.TLP.Quantile = get_stats(output.TLP2.Quantile, irf_true, "TLP Bootstrap Quantile", str);
+end
+if isfield(output, 'SLP2') && isfield(output.SLP2, 'Quantile') && ~isempty(output.SLP2.Quantile)
+    stats.SLP.Quantile = get_stats(output.SLP2.Quantile, irf_true, "SLP Bootstrap Quantile", str);
+end
+
+
+%% Save output
+clear output_cell
+save(fullfile(results_dir, append(name_sim,num2str(T(j)),"_sim",num2str(simulations),"_pL",num2str(P_LP),"_pV",num2str(P_VAR),"_eta",num2str(MA_term_scale),"_DGP_OleaSW_P",num2str(p_DGP),".mat")))
+
+
+end
+% save("current.mat")
+
+%% print tables 
+% ========================================================================
+% Method Selection Flag
+% ========================================================================
+selected_method_num = 7;
+selected_method = sprintf('method%d', selected_method_num);
+method_descriptions = {
+    'Bootstrap Mean', ...
+    'VAR Original (Montiel Olea 2021)', ...
+    'Original Own (Standard)',...
+    'Sanity check 1','Sanity check 2','Sanity check 3',...
+    'Symmetric Bootstrap Mean (Hall 1988)',...
+    'Symmetric VAR Original (Hall 1988)',...
+    'Symmetric Original Own (Hall 1988)'
+};
+
+row_names = ["Average Coverage 90%", "Below CI (too high)", "Above CI (too low)", ...
+    "Average Length", "Average bias", "Average sd deviation", "Root Mean Square Error"];
+
+% ========================================================================
+% Create Comparison Tables Using Selected Method (ALL GUARDED)
+% ========================================================================
+
+% === table4: VAR Direct
+table4 = [];
+if isfield(stats, 'VAR') && isfield(stats.VAR, 'direct')
+    for p = 1:length(P_VAR)
+        table4 = [table4 stats.VAR.direct.table2{p}];
+    end
+    table4.Properties.RowNames = row_names;
+end
+
+% === table5: LP, SLP, BLP legacy methods
+table5 = [];
+if isfield(stats, 'LP') && isfield(stats.LP, 'H') && isfield(stats.LP.H, 'table2')
+    table5 = [table5 stats.LP.H.table2{:}];
+end
+if isfield(stats, 'LP') && isfield(stats.LP, 'B') && isfield(stats.LP.B, 'table2')
+    table5 = [table5 stats.LP.B.table2{:}];
+end
+if isfield(stats, 'SLP') && isfield(stats.SLP, 'H') && isfield(stats.SLP.H, 'table2')
+    table5 = [table5 stats.SLP.H.table2{:}];
+end
+if isfield(stats, 'SLP') && isfield(stats.SLP, 'H_US') && isfield(stats.SLP.H_US, 'table2')
+    table5 = [table5 stats.SLP.H_US.table2{:}];
+end
+if isfield(stats, 'SLP') && isfield(stats.SLP, 'B') && isfield(stats.SLP.B, 'table2')
+    table5 = [table5 stats.SLP.B.table2{:}];
+end
+for p = 1:length(P_VAR)
+    if T(j) ~= 100 && isfield(stats, 'BLP') && isfield(stats.BLP, 'table2')
+        table5 = [table5 stats.BLP.table2{p}];
+    end
+end
+if ~isempty(table5)
+    table5.Properties.RowNames = row_names;
+end
+
+% === table6: New TLP2 comparison tables using SELECTED METHOD
+table6_LP = [];
+table6_VAR = [];
+table6_TLP = [];
+table6_SLP = [];
+
+for p = 1:length(P_VAR)
+    % LP comparison - Studentized with selected method + Quantile
+    if isfield(stats, 'LP') && isfield(stats.LP, 'Studentized') && isfield(stats.LP.Studentized, selected_method)
+        table6_LP = [table6_LP stats.LP.Studentized.(selected_method).table2{p}];
+    end
+    if isfield(stats, 'LP') && isfield(stats.LP, 'Quantile') && isfield(stats.LP.Quantile, 'table2')
+        table6_LP = [table6_LP stats.LP.Quantile.table2{p}];
+    end
+    
+    % VAR comparison - Studentized with selected method + Quantile
+    if isfield(stats, 'VAR') && isfield(stats.VAR, 'Studentized') && isfield(stats.VAR.Studentized, selected_method)
+        table6_VAR = [table6_VAR stats.VAR.Studentized.(selected_method).table2{p}];
+    end
+    if isfield(stats, 'VAR') && isfield(stats.VAR, 'Quantile') && isfield(stats.VAR.Quantile, 'table2')
+        table6_VAR = [table6_VAR stats.VAR.Quantile.table2{p}];
+    end
+    
+    % TLP comparison - Studentized with selected method + Quantile + CombinedQuantile
+    if isfield(stats, 'TLP') && isfield(stats.TLP, 'Studentized') && isfield(stats.TLP.Studentized, selected_method)
+        table6_TLP = [table6_TLP stats.TLP.Studentized.(selected_method).table2{p}];
+    end
+    if isfield(stats, 'TLP') && isfield(stats.TLP, 'Quantile') && isfield(stats.TLP.Quantile, 'table2')
+        table6_TLP = [table6_TLP stats.TLP.Quantile.table2{p}];
+    end
+
+    % SLP comparison - Studentized with selected method + Quantile
+    if isfield(stats, 'SLP') && isfield(stats.SLP, 'Studentized') && isfield(stats.SLP.Studentized, selected_method)
+        table6_SLP = [table6_SLP stats.SLP.Studentized.(selected_method).table2{p}];
+    end
+    if isfield(stats, 'SLP') && isfield(stats.SLP, 'Quantile') && isfield(stats.SLP.Quantile, 'table2')
+        table6_SLP = [table6_SLP stats.SLP.Quantile.table2{p}];
+    end
+    
+    % Add CombinedQuantile if it exists for selected method
+    if isfield(stats, 'TLP') && isfield(stats.TLP, 'CombinedQuantile') && ...
+       isfield(stats.TLP.CombinedQuantile, selected_method)
+        table6_TLP = [table6_TLP stats.TLP.CombinedQuantile.(selected_method).table2{p}];
+    end
+end
+
+if ~isempty(table6_LP);  table6_LP.Properties.RowNames  = row_names; end
+if ~isempty(table6_VAR); table6_VAR.Properties.RowNames = row_names; end
+if ~isempty(table6_TLP); table6_TLP.Properties.RowNames = row_names; end
+if ~isempty(table6_SLP); table6_SLP.Properties.RowNames = row_names; end
+
+% ========================================================================
+% Display Tables (ALL GUARDED)
+% ========================================================================
+disp(' ');
+disp('========================================================================');
+disp(['SELECTED CENTERING METHOD: ' method_descriptions{selected_method_num}]);
+disp('========================================================================');
+
+if ~isempty(table6_LP)
+    disp(' ');
+    disp('=== LP Methods Comparison (Studentized vs Quantile) ===');
+    disp(table6_LP);
+end
+
+if ~isempty(table6_VAR)
+    disp(' ');
+    disp('=== VAR Methods Comparison (Studentized vs Quantile) ===');
+    disp(table6_VAR);
+end
+
+if ~isempty(table6_TLP)
+    disp(' ');
+    disp('=== TLP Methods Comparison (Studentized vs Quantile vs CombinedQuantile) ===');
+    disp(table6_TLP);
+end
+
+if ~isempty(table6_SLP)
+    disp(' ');
+    disp('=== SLP Methods Comparison (Studentized vs Quantile) ===');
+    disp(table6_SLP);
+end
+
+if ~isempty(table4)
+    disp(' ');
+    disp('=== VAR Direct (Backwards Compatible) ===');
+    disp(table4);
+end
+
+if ~isempty(table5)
+    disp(' ');
+    disp('=== LP, SLP, BLP Methods (Backwards Compatible) ===');
+    disp(table5);
+end
+
+% ========================================================================
+% Compare Equal-Tailed vs Symmetric Bootstrap (Hall 1988) (GUARDED)
+% ========================================================================
+table_compare_TLP = [];
+for p = 1:length(P_VAR)
+    if isfield(stats, 'TLP') && isfield(stats.TLP, 'Studentized') && isfield(stats.TLP.Studentized, 'method1')
+        table_compare_TLP = [table_compare_TLP stats.TLP.Studentized.method1.table2{p}];
+    end
+    if isfield(stats, 'TLP') && isfield(stats.TLP, 'Studentized') && isfield(stats.TLP.Studentized, 'method7')
+        table_compare_TLP = [table_compare_TLP stats.TLP.Studentized.method7.table2{p}];
+    end
+end
+if ~isempty(table_compare_TLP)
+    disp(' ');
+    disp('========================================================================');
+    disp('COMPARISON: Equal-Tailed (method1) vs Symmetric (method7) - Hall 1988');
+    disp('Symmetric intervals achieve O(n^-2) coverage error vs O(n^-1) for equal-tailed');
+    disp('========================================================================');
+    table_compare_TLP.Properties.RowNames = row_names;
+    disp('=== TLP: Equal-Tailed vs Symmetric ===');
+    disp(table_compare_TLP);
+end
+
+end
+
+%% Demo picture (1 example of IRF)
+close(gcf) 
+simmm = randi(simulations);
+% simmm =446
+p_picture = 1;
+
+figure;
+set(gcf, 'Units', 'Normalized', 'OuterPosition', [0.1 0.1 0.8 0.8]);
+x = 0:H_max;
+
+% === Shaded CI for LP.B ===
+CI_LP_B = squeeze(stats.LP.Studentized.method7.CI(:,:,simmm)); % size: [H x 2]
+fill([x fliplr(x)], [CI_LP_B(:,1)' fliplr(CI_LP_B(:,2)')], ...
+    'r', 'FaceAlpha', 0.2, 'EdgeColor', 'none'); hold on
+
+% === Shaded CI for TLP.Quantile ===
+CI_TLP = squeeze(stats.TLP.Studentized.method7.CI(:,:,simmm,p_picture)); % size: [H x 2]
+fill([x fliplr(x)], [CI_TLP(:,1)' fliplr(CI_TLP(:,2)')], ...
+    'b', 'FaceAlpha', 0.2, 'EdgeColor', 'none');
+
+% === Shaded CI for VAR.Quantile ===
+CI_VAR = squeeze(stats.VAR.Studentized.method7.CI(:,:,simmm,p_picture)); % size: [H x 2]
+fill([x fliplr(x)], [CI_VAR(:,1)' fliplr(CI_VAR(:,2)')], ...
+    'c', 'FaceAlpha', 0.2, 'EdgeColor', 'none');
+
+% === Lines ===
+plot(x, stats.TLP.Studentized.method7.irf(:,simmm,p_picture), 'b-', 'LineWidth', 3)
+plot(x, stats.VAR.Studentized.method7.irf(:,simmm,p_picture), 'c--', 'LineWidth', 3)
+plot(x, stats.LP.Studentized.method7.irf(:,simmm), 'r--', 'LineWidth', 3)
+plot(x, irf_true, 'k-.', 'LineWidth', 3)
+yline(0, 'LineWidth', 2, 'Color', [0.5, 0.5, 0.5]);
+hold off
+
+h = legend("LP Bootstrap CI", "TLP Bootstrap CI", "VAR Bootstrap CI", ...
+    "TLP", "VAR", "LP", "TRUE", "Zero", ...
+    'Location', 'Best', 'FontSize', 24)
+h.ItemTokenSize = [80, 18];
+
+xlabel('Horizon', 'FontSize', 24)
+ylabel('IRF', 'FontSize', 24)
+title(sprintf('IRF Comparison (Simulation %d, p=%d)', simmm, str.P_VAR(p_picture)), 'FontSize', 30)
+set(gca, 'FontSize', 24)
+grid on
+box off
